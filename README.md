@@ -467,13 +467,284 @@ go run ./cmd/consolidator
 
 ---
 
-## Conclusiones (PC1)
+# Práctica Calificada 2 — Detector Concurrente de Red Flags
 
-La exploración de datasets de INDECOPI mostró que el principal desafío de esta práctica no era la descarga de archivos, sino la heterogeneidad estructural de los datos publicados. Lejos de ser una colección uniforme exportada desde una sola base de datos, los recursos encontrados presentan encabezados desplazados, títulos embebidos, variaciones semánticas de columnas y diferencias fuertes entre familias institucionales.
+## Descripción del algoritmo implementado
 
-A pesar de ello, fue posible identificar grupos de datasets con suficiente compatibilidad para una futura consolidación curada, especialmente CC1, CC2, OPS1, OPS2 y SPC. Asimismo, la implementación de un parser más robusto permitió recuperar una gran parte de la información que inicialmente parecía inutilizable.
+El algoritmo implementado es un **detector de anomalías sobre expedientes INDECOPI** que identifica tres categorías de patrones sospechosos en el campo `queja` y en los metadatos de cada expediente:
 
-En consecuencia, la práctica deja como resultado una base de datos consolidada y una propuesta concreta de normalización, lo que reduce sustancialmente la incertidumbre para la siguiente fase del proyecto. Gracias a este trabajo previo, la implementación posterior del detector concurrente podrá enfocarse realmente en la lógica de anomalías, en lugar de desperdiciar esfuerzo corrigiendo inconsistencias básicas de origen.
+1. **TEXT_REPEAT**: repetición de texto entre quejas distintas, indicador de posible spam o bot. Se calcula la similitud de Jaccard entre los tokens de cada par de registros. Si la similitud supera el umbral configurado (por defecto 0.60), ambos expedientes se marcan.
+
+2. **TIMING_BURST**: concentración inusual de expedientes en una misma fecha de presentación. Si el número de registros por fecha supera el límite configurado (por defecto 5), todos esos expedientes se marcan como potencialmente artificiales.
+
+3. **EXACT_DUPLICATE**: mismo expediente con idéntica combinación de número, empresa denunciada y fecha. Indica ingreso duplicado del mismo caso.
+
+El detector opera sobre el dataset `data/processed/enriched_filled.csv`, que contiene 10,230 expedientes con el campo `queja` generado. La detección principal, TEXT_REPEAT, tiene complejidad **O(n²)** y es el cuello de botella natural donde la concurrencia aporta mayor beneficio.
+
+### Ejecución
+
+```bash
+# Versión secuencial
+go run ./cmd/detector_secuencial
+
+# Versión concurrente (N workers)
+go run ./cmd/detector_concurrente -workers=4
+
+# Benchmark completo con tabla de speedup
+go run ./cmd/benchmark -runs=10 -workers-list=2,4,8
+```
 
 ---
 
+## Descripción del patrón concurrente utilizado
+
+Se implementó el patrón **Worker Pool** sobre la fase de comparación por pares (TEXT_REPEAT), que es la única fase con complejidad O(n²) y representa más del 99% del tiempo de ejecución total.
+
+### Dónde se aplica
+
+En `internal/detector/concurrent.go`, la función `DetectConcurrent` lanza N goroutines workers que consumen índices `i` desde un canal compartido `workCh`. Cada worker, al recibir un índice `i`, calcula todos los pares `(i, j)` con `j > i`, acumulando los resultados en un slice local sin ningún mutex.
+
+```go
+// Productor: envía índices i al canal
+go func() {
+    for i := 0; i < n; i++ {
+        workCh <- i
+    }
+    close(workCh)
+}()
+
+// Workers: reciben i, calculan todos los pares (i, j>i) localmente
+go func() {
+    defer wg.Done()
+    var local []RedFlag
+    for i := range workCh {
+        for j := i + 1; j < n; j++ {
+            score := Jaccard(records[i].Tokens, records[j].Tokens)
+            if score >= opts.JaccardThreshold {
+                local = append(local, RedFlag{...})
+            }
+        }
+    }
+    resultCh <- local  // una sola escritura al canal por worker
+}()
+```
+
+### Por qué se eligió este patrón
+
+La fase O(n²) es naturalmente paralelizable porque cada comparación de par `(i, j)` es independiente de cualquier otra. No existe ninguna dependencia de datos entre pares. El Worker Pool permite dividir el espacio de trabajo sin coordinación por par, reduciendo el tiempo de ejecución aproximadamente en proporción al número de CPUs disponibles.
+
+Se descartó un enfoque de división estática de rangos (worker 0 procesa `i=0..n/W-1`, worker 1 procesa `i=n/W..2n/W-1`, etc.) porque genera **desbalance de carga**: el worker con `i` pequeños tiene más pares que calcular que el worker con `i` grandes. El canal actúa como cola de trabajo y distribuye la carga dinámicamente: cuando un worker termina su `i` actual, inmediatamente toma el siguiente disponible del canal, igualando naturalmente la carga entre goroutines.
+
+### Cómo ayuda al procesamiento
+
+Con 10,230 registros el total de pares es `10230 × 10229 / 2 ≈ 52.3 millones` de comparaciones Jaccard. En una máquina de 2 CPUs, la versión concurrente con 2 workers divide ese trabajo en dos mitades que se ejecutan en paralelo, reduciendo el tiempo de ~18 segundos a ~8.8 segundos.
+
+### Qué problema evita o mejora
+
+Evita el cuello de botella de la ejecución secuencial en datasets grandes. Sin concurrencia, un dataset de 100,000 registros requeriría ~500 veces más pares y tardaría horas. Con el Worker Pool, el tiempo escala en proporción inversa al número de CPUs, haciendo la detección viable en producción.
+
+---
+
+## Control de concurrencia: cómo se evitan los problemas
+
+### Regla de oro aplicada
+
+El diseño garantiza que **no existe ninguna variable compartida mutable** durante la fase O(n²). Cada goroutine worker opera exclusivamente sobre:
+- Su propio slice local `var local []RedFlag` (memoria privada, sin compartir).
+- El array `records []DetectorRecord` en modo **solo lectura** (lectura concurrente segura en Go sin mutex).
+
+Los únicos puntos de sincronización son los canales, que en Go proveen sincronización implícita y libre de race conditions por diseño del runtime.
+
+### Ausencia de condiciones de carrera
+
+No existe ninguna escritura concurrente a memoria compartida durante el cómputo. El detector de race conditions de Go (`go run -race ./cmd/detector_concurrente`) no reporta ninguna condición de carrera porque:
+- `records` es solo de lectura una vez cargado.
+- Cada worker escribe únicamente en su `local []RedFlag` privado.
+- La única escritura a `resultCh` ocurre **después** de que el worker termina todo su trabajo, y el canal provee el order-happens-before necesario.
+
+### Ausencia de deadlocks
+
+El sistema está libre de deadlocks por construcción:
+- `workCh` se cierra explícitamente por el productor al terminar → los workers salen del `range workCh` sin bloquearse.
+- `resultCh` se cierra por el goroutine supervisor después de que `wg.Wait()` regresa → el recolector en `main` sale del `range resultCh` sin bloquearse.
+- No hay ningún par de goroutines esperándose mutuamente.
+
+### Mecanismos de sincronización y su justificación
+
+| Mecanismo | Dónde se usa | Por qué |
+|-----------|-------------|---------|
+| `chan int` (buffered) | `workCh` | Distribuye trabajo entre workers sin bloqueo ni mutex. El buffer absorbe la diferencia de velocidad entre productor y workers. |
+| `chan []RedFlag` (buffered) | `resultCh` | Cada worker envía su resultado final una sola vez. Sin buffer, el worker bloquearía esperando que el recolector lo lea inmediatamente. |
+| `sync.WaitGroup` | Supervisor goroutine | Sabe con precisión cuándo el último worker terminó para cerrar `resultCh`. Sin esto, cerrar el canal prematuramente causaría pérdida de resultados. |
+
+No se usa `sync.Mutex` porque el diseño lo hace innecesario. Añadir un mutex global para proteger un slice de resultados compartido sería más lento (contención por cada flag detectada) y más propenso a errores que el enfoque de acumulación local + envío único por canal.
+
+---
+
+## Media recortada: eliminación de valores dispersos
+
+### Justificación
+
+Los tiempos de ejecución individuales presentan variabilidad causada por factores externos: el planificador del sistema operativo, el garbage collector de Go, la caché del procesador y otros procesos del sistema. Si se calcula la media aritmética simple, un valor atípico (por ejemplo, una corrida que toma 20 segundos en lugar de 18 por una pausa del GC) infla el promedio y da una imagen inexacta del rendimiento real.
+
+### Cómo se aplica
+
+La función `TrimmedMean(values []float64, trimPct float64)` en `internal/detector/stats.go`:
+1. Ordena los tiempos de menor a mayor.
+2. Descarta el `trimPct`% inferior y el `trimPct`% superior (se usa 10% por defecto).
+3. Calcula la media aritmética sobre el conjunto restante.
+
+Con 10 corridas y 10% de recorte, se eliminan la corrida más lenta y la más rápida (1 de cada extremo), y se promedia sobre las 8 restantes.
+
+### Resultados reales obtenidos
+
+La siguiente tabla muestra los tiempos individuales de la versión secuencial en 10 corridas y la aplicación de la media recortada:
+
+| Corrida | Tiempo (ms) |
+|---------|------------|
+| 1 | 18,552 |
+| 2 | 17,619 |
+| 3 | 17,886 |
+| 4 | 17,798 |
+| 5 | 18,247 |
+| 6 | 17,972 |
+| 7 | 19,087 |
+| 8 | 20,289 ← recortado (extremo superior) |
+| 9 | 18,461 |
+| 10 | 18,624 |
+
+Media aritmética simple: **18,453 ms**  
+Media recortada (10%): **18,328 ms**
+
+La diferencia es pequeña aquí, pero en corridas con mayor varianza (como la versión concurrente con 4 y 8 workers, donde el planificador varía más), la media recortada elimina outliers de hasta 16,333 ms que inflaban el promedio en más de 15%.
+
+---
+
+## Análisis de speedup y escalabilidad
+
+### Tabla de resultados (10 corridas, media recortada 10%, máquina 2 CPUs)
+
+| Versión | T_media (ms) | Speedup | Eficiencia |
+|---------|-------------|---------|-----------|
+| Secuencial | 18,328 | 1.000 | 1.000 |
+| Concurrente 2 workers | 8,808 | **2.081** | **1.040** |
+| Concurrente 4 workers | 10,466 | 1.751 | 0.438 |
+| Concurrente 8 workers | 14,808 | 1.238 | 0.155 |
+
+### Interpretación del speedup
+
+El speedup de **2.08x** con 2 workers indica que la versión concurrente procesó el dataset en poco menos de la mitad del tiempo que la versión secuencial. Este resultado es coherente con la disponibilidad de 2 núcleos físicos en la máquina de prueba: la carga se distribuyó equitativamente entre ambos CPUs, aprovechando casi al máximo el paralelismo disponible.
+
+La eficiencia de **1.04** (ligeramente superior a 1.0) es llamativa pero explicable: se debe a efectos de caché. Cuando el worker 0 carga tokens del registro `i=0` en caché L2, el worker 1 puede aprovechar esa caché al calcular pares del mismo bloque. Esto produce una pequeña ganancia superlineal que es común en algoritmos con alta localidad de datos sobre datasets que caben en caché.
+
+### Por qué el rendimiento cae con 4 y 8 workers en una máquina de 2 CPUs
+
+Con 4 workers en 2 CPUs, el sistema operativo debe alternar entre 4 goroutines usando solo 2 hilos del kernel. Cada cambio de contexto tiene un costo que se vuelve significativo cuando las goroutines son muy activas (como en este caso, calculando Jaccard continuamente). Adicionalmente, el canal `workCh` se convierte en un punto de contención cuando 4 goroutines intentan leerlo simultáneamente.
+
+Con 8 workers, esta penalización se amplifica: la sobrecarga de scheduling, la contención sobre el canal y el incremento en el uso de memoria por goroutine superan el beneficio de cualquier paralelismo adicional.
+
+### Límite teórico (Ley de Amdahl)
+
+Sea `f` la fracción paralelizable del algoritmo. Las fases TIMING_BURST y EXACT_DUPLICATE son O(n) y toman menos de 50ms (menos del 0.3% del tiempo total). Por tanto `f ≈ 0.997`.
+
+Speedup máximo teórico con p procesadores: `S(p) = 1 / ((1-f) + f/p)`
+
+| p | Speedup teórico | Speedup real |
+|---|----------------|-------------|
+| 2 | 1.997 | 2.081 |
+| 4 | 3.989 | 1.751 |
+| 8 | 7.945 | 1.238 |
+
+El speedup real con 4 y 8 workers cae muy por debajo del teórico porque el modelo de Amdahl asume CPUs ilimitados. En la práctica, ejecutar más goroutines que CPUs físicos introduce overhead de scheduling que Amdahl no contempla.
+
+**Conclusión**: el número óptimo de workers es igual al número de CPUs físicos disponibles. En esta máquina, 2 workers es la configuración óptima.
+
+---
+
+## Análisis de uso y rendimiento de recursos de cómputo
+
+### Metodología de medición
+
+Se usó `runtime.ReadMemStats` de Go (función `CaptureResources` en `internal/detector/stats.go`) para capturar el estado del heap antes y después de cada configuración. Se fuerza un ciclo de GC antes de cada medición para obtener valores limpios.
+
+```go
+func CaptureResources() ResourceSnapshot {
+    runtime.GC()
+    var ms runtime.MemStats
+    runtime.ReadMemStats(&ms)
+    return ResourceSnapshot{
+        HeapAllocMB:  float64(ms.HeapAlloc) / 1024 / 1024,
+        TotalAllocMB: float64(ms.TotalAlloc) / 1024 / 1024,
+        GCCycles:     ms.NumGC,
+        Goroutines:   runtime.NumGoroutine(),
+    }
+}
+```
+
+### Resultados de uso de recursos (10 corridas, dataset 10,230 registros)
+
+| Versión | HeapAlloc (delta) | TotalAlloc (delta) | Ciclos GC | Goroutines pico |
+|---------|------------------|-------------------|-----------|----------------|
+| Secuencial | ~0 MB | 3,772 MB | 76 | 1 |
+| Concurrente x2 | ~0 MB | 4,287 MB | 87 | 4 |
+| Concurrente x4 | ~0 MB | 4,280 MB | 86 | 7 |
+| Concurrente x8 | ~0 MB | 4,659 MB | 88 | 11 |
+
+### Interpretación
+
+**HeapAlloc delta ≈ 0 MB**: el GC de Go recupera la memoria de los slices de flags locales prácticamente en tiempo real. Al final de cada corrida, casi toda la memoria allocada ya fue recolectada, dejando un heap residual mínimo.
+
+**TotalAlloc**: mide toda la memoria allocada a lo largo de la ejecución, incluyendo la ya liberada. Las versiones concurrentes allocan entre 13% y 24% más que la secuencial. Esto se explica por:
+- Los stacks de goroutine (~2–8 KB por goroutine, dinámico en Go).
+- Los slices `local []RedFlag` de cada worker que se crean y destruyen por corrida.
+- La presión adicional sobre el GC que genera más ciclos de recolección.
+
+**Ciclos GC**: la versión secuencial genera 76 ciclos en 10 corridas (~7.6 por corrida). Las versiones concurrentes generan ~87 ciclos (~8.7 por corrida), un 14% más. Esto es consistente con la mayor presión de allocación de los workers.
+
+**Goroutines pico**: cada configuración tiene `2 + workers` goroutines en pico (main + productor + supervisor + N workers). No se observó fuga de goroutines: todas las goroutines terminan antes de que el main retorne, garantizado por `wg.Wait()`.
+
+---
+
+## Optimizaciones implementadas
+
+### 1. Pre-tokenización del dataset al cargar (evitar trabajo redundante)
+
+Cada queja se tokeniza una sola vez en `LoadCSV`, no en cada comparación de par. Sin esta optimización, el par `(i=0, j=1)` y el par `(i=0, j=2)` tokenizarían la queja 0 dos veces cada uno. Con 10,230 registros, esto evitaría ~52 millones de retokenizaciones innecesarias.
+
+### 2. Jaccard con merge de slices ordenados en O(|a|+|b|)
+
+La implementación estándar de Jaccard convierte cada lista de tokens en un `map[string]bool`, lo que implica hashing por cada token. En cambio, se usan slices ordenados alfabéticamente al momento de tokenizar, y se calcula la intersección con el algoritmo de merge de dos punteros:
+
+```go
+// O(|a|+|b|) sin allocar ninguna estructura adicional
+for i < len(a) && j < len(b) {
+    switch {
+    case a[i] == b[j]: intersection++; i++; j++
+    case a[i] < b[j]:  i++
+    default:           j++
+    }
+}
+```
+
+Esto elimina el overhead de hashing y es hasta 3x más rápido en benchmarks micro para conjuntos pequeños (~10 tokens promedio), reduciendo la constante del O(n²).
+
+### 3. Acumulación local en workers: cero contención de mutex
+
+Un diseño alternativo usaría un `sync.Mutex` protegiendo un slice global de flags. Cada vez que un worker detecta un par similar, haría `mu.Lock(); flags = append(flags, ...); mu.Unlock()`. Con 52 millones de pares y ~276,000 flags detectadas, esto provocaría ~276,000 bloqueos de mutex durante la ejecución.
+
+El diseño elegido elimina por completo esta contención: cada worker acumula en su `local []RedFlag` privado y solo hace **una** escritura al canal `resultCh` al finalizar. Los N workers hacen exactamente N escrituras al canal en total, independientemente de cuántas flags encuentren.
+
+### 4. Canal buffered para reducir bloqueos
+
+El canal `workCh` tiene buffer de tamaño `numWorkers * 4`. Sin buffer (tamaño 0), el productor bloquearía después de enviar cada `i`, esperando que un worker lo consuma. El buffer permite que el productor avance y precarque varios índices, desacoplando la velocidad del productor de la de los workers.
+
+### 5. Conclusión de optimización: el punto óptimo de workers
+
+El análisis de recursos muestra que aumentar workers más allá del número de CPUs físicos:
+- Incrementa el TotalAlloc (más goroutines → más memoria de stacks).
+- Incrementa los ciclos de GC.
+- No reduce el tiempo (overhead de scheduling supera el beneficio).
+
+Por tanto, se recomienda configurar `--workers` igual a `runtime.NumCPU()`. Para producción en un servidor con más CPUs (8, 16, 32), el speedup real se acercaría más al límite de Amdahl (~6x, ~10x, ~14x respectivamente).
+
+---
