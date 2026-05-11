@@ -158,8 +158,12 @@ func rowHash(r normalize.ConsolidatedRecord) int64 {
 // FillFromTemplates genera una queja mediante plantillas combinatorias sin usar LLM.
 // El resultado es determinista: misma fila → mismo texto siempre.
 func FillFromTemplates(r normalize.ConsolidatedRecord) string {
-	rng := rand.New(rand.NewSource(rowHash(r)))
+	return FillFromTemplatesWithRng(r, rand.New(rand.NewSource(rowHash(r))))
+}
 
+// FillFromTemplatesWithRng genera una queja usando un rng externo.
+// Permite crear variantes del mismo registro cambiando el seed.
+func FillFromTemplatesWithRng(r normalize.ConsolidatedRecord, rng *rand.Rand) string {
 	tipo := strings.ToLower(r.TipoExpediente)
 	if tipo == "" {
 		tipo = "expediente"
