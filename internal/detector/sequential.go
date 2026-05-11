@@ -9,49 +9,107 @@ import (
 type Options struct {
 	JaccardThreshold float64 // similitud mínima para marcar TEXT_REPEAT (default 0.60)
 	BurstLimit       int     // expedientes por fecha para marcar TIMING_BURST (default 5)
+	KeywordThreshold int     // keywords mínimas para marcar KEYWORD_SPAM (default 1)
+
+	DisableTextRepeat bool // desactiva fase TEXT_REPEAT (bench seguro)
+
+	MinKeywordDocFreq      int     // df mínima para keyword-index
+	MaxKeywordDocFreqRatio float64 // df máxima como ratio de N (ej 0.05)
+	MinSharedKeywords      int     // mínimo de keywords compartidas para comparar con Jaccard
+	MinTokenLength         int     // longitud mínima de token (aplica al vocab)
+	MaxCandidatesPerRecord int     // keyword-index: máximo de candidatos verificados por registro (0=sin tope)
+
+	UsePrefixFilter     bool // keyword-index: indexar solo tokens del prefijo (PPJoin-style)
+	UseLengthFilter     bool // keyword-index: filtro por ratio de longitudes antes de Jaccard
+	UseUpperBoundFilter bool // keyword-index: filtro por cota superior (posición/prefijo) antes de Jaccard
+
+	MinRareScore        uint32 // keyword-index: descartar candidatos con rare score < este valor
+	MaxPrefixTokens     int    // keyword-index: cap de tokens de prefijo por registro (0=sin tope)
+	MaxPostingsPerToken int    // keyword-index: cap de postings por token (0=sin tope)
 }
 
-// DefaultOptions retorna la configuración por defecto.
+// DefaultOptions retorna la configuración estándar del detector para 1M registros.
 func DefaultOptions() Options {
-	return Options{JaccardThreshold: 0.60, BurstLimit: 5}
+	return Options{
+		JaccardThreshold:       0.60,
+		BurstLimit:             5,
+		KeywordThreshold:       1,
+		MinKeywordDocFreq:      4,
+		MaxKeywordDocFreqRatio: 0.003,
+		MinSharedKeywords:      7,
+		MinTokenLength:         6,
+		MaxCandidatesPerRecord: 10,
+		UsePrefixFilter:        true,
+		UseLengthFilter:        true,
+		UseUpperBoundFilter:    true,
+	}
+}
+
+func normalizeOptions(opts Options) Options {
+	defaults := DefaultOptions()
+	if opts.JaccardThreshold <= 0 {
+		opts.JaccardThreshold = defaults.JaccardThreshold
+	}
+	if opts.BurstLimit <= 0 {
+		opts.BurstLimit = defaults.BurstLimit
+	}
+	if opts.KeywordThreshold <= 0 {
+		opts.KeywordThreshold = defaults.KeywordThreshold
+	}
+	if opts.MinKeywordDocFreq <= 0 {
+		opts.MinKeywordDocFreq = defaults.MinKeywordDocFreq
+	}
+	if opts.MaxKeywordDocFreqRatio <= 0 {
+		opts.MaxKeywordDocFreqRatio = defaults.MaxKeywordDocFreqRatio
+	}
+	if opts.MinSharedKeywords <= 0 {
+		opts.MinSharedKeywords = defaults.MinSharedKeywords
+	}
+	if opts.MinTokenLength <= 0 {
+		opts.MinTokenLength = defaults.MinTokenLength
+	}
+	if opts.MaxCandidatesPerRecord <= 0 {
+		opts.MaxCandidatesPerRecord = defaults.MaxCandidatesPerRecord
+	}
+	opts.UsePrefixFilter = true
+	opts.UseLengthFilter = true
+	opts.UseUpperBoundFilter = true
+	return opts
+}
+
+func StandardTextRepeatSummary(opts Options) string {
+	opts = normalizeOptions(opts)
+	return fmt.Sprintf(
+		"keyword-index min-df=%d max-df-ratio=%.6f min-shared=%d min-len=%d max-candidates-per-record=%d prefix=%t length-filter=%t upper-bound=%t",
+		opts.MinKeywordDocFreq,
+		opts.MaxKeywordDocFreqRatio,
+		opts.MinSharedKeywords,
+		opts.MinTokenLength,
+		opts.MaxCandidatesPerRecord,
+		opts.UsePrefixFilter,
+		opts.UseLengthFilter,
+		opts.UseUpperBoundFilter,
+	)
 }
 
 // DetectSequential ejecuta las tres fases de detección en un único goroutine.
 // Retorna las red flags detectadas y el tiempo total de procesamiento.
 func DetectSequential(records []DetectorRecord, opts Options) ([]RedFlag, time.Duration) {
+	return DetectSequentialWithVocab(records, nil, opts)
+}
+
+func DetectSequentialWithVocab(records []DetectorRecord, vocab *Vocab, opts Options) ([]RedFlag, time.Duration) {
 	start := time.Now()
+	opts = normalizeOptions(opts)
 	n := len(records)
 	var flags []RedFlag
 
-	// --- Fase 1: TEXT_REPEAT — O(n²) comparación de todos los pares ---
-	// Para cada par (i,j) calcula Jaccard sobre tokens pre-computados.
-	// Si la similitud supera el umbral, ambos registros se marcan como sospechosos.
-	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
-			score := Jaccard(records[i].Tokens, records[j].Tokens)
-			if score >= opts.JaccardThreshold {
-				detail := fmt.Sprintf("similar a expediente %s (score=%.2f)", records[j].Expediente, score)
-				flags = append(flags, RedFlag{
-					RecordIndex:  i,
-					Expediente:   records[i].Expediente,
-					DatasetID:    records[i].DatasetID,
-					FlagType:     FlagTextRepeat,
-					Score:        score,
-					Details:      detail,
-					QuejaPreview: quejaPreview(records[i].Queja),
-				})
-				detail2 := fmt.Sprintf("similar a expediente %s (score=%.2f)", records[i].Expediente, score)
-				flags = append(flags, RedFlag{
-					RecordIndex:  j,
-					Expediente:   records[j].Expediente,
-					DatasetID:    records[j].DatasetID,
-					FlagType:     FlagTextRepeat,
-					Score:        score,
-					Details:      detail2,
-					QuejaPreview: quejaPreview(records[j].Queja),
-				})
-			}
-		}
+	// --- Fase 1: TEXT_REPEAT — keyword-index + filtros + Jaccard final ---
+	if !opts.DisableTextRepeat {
+		idx, stats := BuildKeywordIndex(records, vocab, opts)
+		_ = stats
+		trFlags, _, _ := detectTextRepeatKeywordIndexFlags(records, idx, opts)
+		flags = append(flags, trFlags...)
 	}
 
 	// --- Fase 2: TIMING_BURST — O(n) agrupación por fecha ---
@@ -111,6 +169,11 @@ func DetectSequential(records []DetectorRecord, opts Options) ([]RedFlag, time.D
 			seen[key] = i
 		}
 	}
+
+	// --- Fase 4: KEYWORD_SPAM — O(n·k) escaneo de palabras clave sospechosas ---
+	// Detecta quejas que contienen lenguaje de spam, phishing, markdown o texto
+	// auto-generado por plantillas. Independiente del Jaccard.
+	flags = append(flags, DetectKeywordSpam(records, opts)...)
 
 	return flags, time.Since(start)
 }

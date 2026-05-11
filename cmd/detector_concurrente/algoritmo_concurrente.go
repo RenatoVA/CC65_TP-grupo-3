@@ -17,23 +17,19 @@ import (
 func main() {
 	input := flag.String("input", "data/processed/enriched_filled.csv", "CSV de entrada con campo queja")
 	output := flag.String("output", "data/results/flagged_records_conc.csv", "CSV de salida con red flags")
-	threshold := flag.Float64("threshold", 0.60, "Umbral Jaccard para TEXT_REPEAT (0-1)")
-	burstLimit := flag.Int("burst-limit", 5, "Max expedientes por fecha para TIMING_BURST")
 	workers := flag.Int("workers", runtime.NumCPU(), "Número de goroutines worker")
 	runs := flag.Int("runs", 1, "Número de corridas (mide tiempo de cada una)")
 	flag.Parse()
 
 	log.Printf("cargando dataset: %s", *input)
-	records, err := detector.LoadCSV(*input)
+	records, vocab, err := detector.LoadCSVConcurrentWithVocab(*input, *workers)
 	if err != nil {
 		log.Fatalf("error cargando CSV: %v", err)
 	}
 	log.Printf("%d registros cargados | workers=%d | CPUs=%d", len(records), *workers, runtime.NumCPU())
 
-	opts := detector.Options{
-		JaccardThreshold: *threshold,
-		BurstLimit:       *burstLimit,
-	}
+	opts := detector.DefaultOptions()
+	log.Printf("TEXT_REPEAT: %s", detector.StandardTextRepeatSummary(opts))
 
 	resBefore := detector.CaptureResources()
 
@@ -41,7 +37,7 @@ func main() {
 	var durations []float64
 
 	for run := 1; run <= *runs; run++ {
-		f, d := detector.DetectConcurrent(records, opts, *workers)
+		f, d := detector.DetectConcurrentWithVocab(records, vocab, opts, *workers)
 		durations = append(durations, float64(d.Milliseconds()))
 		flags = f
 		log.Printf("[corrida %d/%d] tiempo=%s flags=%d workers=%d",
@@ -70,6 +66,7 @@ func main() {
 	fmt.Printf("  TEXT_REPEAT:      %d\n", counts[detector.FlagTextRepeat])
 	fmt.Printf("  TIMING_BURST:     %d\n", counts[detector.FlagTimingBurst])
 	fmt.Printf("  EXACT_DUPLICATE:  %d\n", counts[detector.FlagExactDuplicate])
+	fmt.Printf("  KEYWORD_SPAM:     %d\n", counts[detector.FlagKeywordSpam])
 
 	if err := writeFlags(*output, flags); err != nil {
 		log.Fatalf("error escribiendo output: %v", err)

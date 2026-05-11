@@ -2,103 +2,29 @@ package detector
 
 import (
 	"fmt"
-	"sync"
 	"time"
 )
 
-// DetectConcurrent ejecuta la detección usando un Worker Pool para la fase O(n²).
-//
-// Patrón: Worker Pool sobre la Fase 1 (TEXT_REPEAT).
-//   - Un productor envía valores de i (índice de fila fuente) al canal workCh.
-//   - Cada worker recibe un i y computa todos los pares (i, j>i) localmente,
-//     acumulando flags en un slice local SIN mutex.
-//   - Al agotar workCh, el worker envía su slice local de una sola vez a resultCh.
-//   - Un WaitGroup señala al goroutine supervisor cuándo cerrar resultCh.
-//   - El goroutine principal recolecta todos los slices locales de resultCh.
-//
-// Ventajas frente a mutex global:
-//   - Cero contención durante el cómputo: cada worker trabaja en memoria propia.
-//   - La única escritura concurrente ocurre UNA vez por worker (envío final a resultCh).
-//   - No hay deadlocks posibles: canales son la única primitiva de sincronización.
-//   - El canal buffered workCh absorbe la diferencia de velocidad entre productor y workers.
+// DetectConcurrent ejecuta la detección con TEXT_REPEAT keyword-index.
 func DetectConcurrent(records []DetectorRecord, opts Options, numWorkers int) ([]RedFlag, time.Duration) {
+	return DetectConcurrentWithVocab(records, nil, opts, numWorkers)
+}
+
+func DetectConcurrentWithVocab(records []DetectorRecord, vocab *Vocab, opts Options, numWorkers int) ([]RedFlag, time.Duration) {
 	start := time.Now()
+	opts = normalizeOptions(opts)
 	n := len(records)
 
-	// workCh distribuye los índices i a los workers.
-	// Buffer = numWorkers*4 para que el productor no bloquee constantemente.
-	workCh := make(chan int, numWorkers*4)
-
-	// resultCh recibe el slice de flags local de cada worker al terminar.
-	// Buffer = numWorkers para que los workers no bloqueen al enviar su resultado final.
-	resultCh := make(chan []RedFlag, numWorkers)
-
-	var wg sync.WaitGroup
-
-	// --- Lanzar workers ---
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var local []RedFlag // acumulación local: sin mutex, sin contención
-
-			for i := range workCh {
-				for j := i + 1; j < n; j++ {
-					score := Jaccard(records[i].Tokens, records[j].Tokens)
-					if score >= opts.JaccardThreshold {
-						detail := fmt.Sprintf("similar a expediente %s (score=%.2f)", records[j].Expediente, score)
-						local = append(local, RedFlag{
-							RecordIndex:  i,
-							Expediente:   records[i].Expediente,
-							DatasetID:    records[i].DatasetID,
-							FlagType:     FlagTextRepeat,
-							Score:        score,
-							Details:      detail,
-							QuejaPreview: quejaPreview(records[i].Queja),
-						})
-						detail2 := fmt.Sprintf("similar a expediente %s (score=%.2f)", records[i].Expediente, score)
-						local = append(local, RedFlag{
-							RecordIndex:  j,
-							Expediente:   records[j].Expediente,
-							DatasetID:    records[j].DatasetID,
-							FlagType:     FlagTextRepeat,
-							Score:        score,
-							Details:      detail2,
-							QuejaPreview: quejaPreview(records[j].Queja),
-						})
-					}
-				}
-			}
-
-			resultCh <- local // una sola escritura al canal por worker
-		}()
+	// --- Fase 1: TEXT_REPEAT con keyword-index ---
+	flags := make([]RedFlag, 0)
+	if !opts.DisableTextRepeat {
+		idx, stats := BuildKeywordIndex(records, vocab, opts)
+		_ = stats
+		trFlags, _, _ := detectTextRepeatKeywordIndexFlags(records, idx, opts)
+		flags = append(flags, trFlags...)
 	}
 
-	// --- Productor: envía valores de i al canal ---
-	// Goroutine separada para no bloquear el goroutine principal.
-	go func() {
-		for i := 0; i < n; i++ {
-			workCh <- i
-		}
-		close(workCh) // señal a los workers de que no hay más trabajo
-	}()
-
-	// --- Supervisor: cierra resultCh cuando todos los workers terminaron ---
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	// --- Recolector: goroutine principal recibe todos los slices locales ---
-	var flags []RedFlag
-	for local := range resultCh {
-		flags = append(flags, local...)
-	}
-
-	// --- Fases 2 y 3 son O(n): se ejecutan secuencialmente ---
-	// El overhead de paralelizarlas sería mayor que el beneficio para n=10k.
-
-	// Fase 2: TIMING_BURST
+	// --- Fase 2: TIMING_BURST — O(n) secuencial ---
 	dateBuckets := make(map[string][]int, n/10)
 	for i, r := range records {
 		if r.FechaPresentacion != "" {
@@ -121,7 +47,7 @@ func DetectConcurrent(records []DetectorRecord, opts Options, numWorkers int) ([
 		}
 	}
 
-	// Fase 3: EXACT_DUPLICATE
+	// --- Fase 3: EXACT_DUPLICATE — O(n) secuencial ---
 	seen := make(map[string]int, n)
 	for i, r := range records {
 		key := r.Expediente + "|" + r.Denunciado + "|" + r.FechaPresentacion
@@ -151,6 +77,9 @@ func DetectConcurrent(records []DetectorRecord, opts Options, numWorkers int) ([
 			seen[key] = i
 		}
 	}
+
+	// --- Fase 4: KEYWORD_SPAM --- O(n·k), misma lógica que secuencial
+	flags = append(flags, DetectKeywordSpam(records, opts)...)
 
 	return flags, time.Since(start)
 }

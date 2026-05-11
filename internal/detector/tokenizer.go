@@ -56,6 +56,63 @@ func Tokenize(text string) []string {
 	return tokens
 }
 
+// TokenizeToIDs convierte texto en un slice de IDs uint32 ordenados usando el vocab global.
+// Mismo pipeline que Tokenize() pero el output son enteros → comparación 4x más rápida.
+func TokenizeToIDs(text string, vocab *Vocab) []uint32 {
+	text = strings.ToLower(text)
+	var sb strings.Builder
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune(' ')
+		}
+	}
+	words := strings.Fields(sb.String())
+	seen := make(map[uint32]struct{}, len(words))
+	ids := make([]uint32, 0, len(words))
+	for _, w := range words {
+		if len(w) < 3 || spanishStopwords[w] {
+			continue
+		}
+		id := vocab.GetOrAdd(w)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// JaccardUint32 calcula Jaccard sobre slices de uint32 ordenados.
+// Merge de dos punteros O(|a|+|b|) comparando enteros — sin string hashing.
+func JaccardUint32(a, b []uint32) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	intersection := 0
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			intersection++
+			i++
+			j++
+		case a[i] < b[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	union := len(a) + len(b) - intersection
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
 // Jaccard calcula la similitud de Jaccard entre dos slices de tokens ordenados.
 // Usa merge de dos punteros en O(|a|+|b|) sin allocar sets.
 func Jaccard(a, b []string) float64 {

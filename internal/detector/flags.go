@@ -4,6 +4,7 @@ const (
 	FlagTextRepeat     = "TEXT_REPEAT"
 	FlagTimingBurst    = "TIMING_BURST"
 	FlagExactDuplicate = "EXACT_DUPLICATE"
+	FlagKeywordSpam    = "KEYWORD_SPAM"
 )
 
 // RedFlag representa una anomalía detectada en un expediente.
